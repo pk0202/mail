@@ -1,5 +1,6 @@
-fastapi
-uvicorn[standard]
-msal
-requests
-python-dotenv
+fastapi==0.110.0
+uvicorn[standard]==0.32.0
+msal==1.28.0
+requests==2.32.3
+pydantic==2.7.0
+python-dotenv==1.0.1
