@@ -1,6 +1,5 @@
 import os
 import json
-import base64
 from typing import List, Optional
 
 import msal
@@ -10,18 +9,31 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 
-load_dotenv()
+load_dotenv(override=True)
 
-CLIENT_ID = os.getenv("CLIENT_ID")
+# ---------- Config ----------
+
+CLIENT_ID = os.getenv("CLIENT_ID1")
+CLIENT_SECRET = os.getenv("CLIENT_SECRET")
 TENANT_ID = os.getenv("TENANT_ID", "common")
-SCOPES = (os.getenv("SCOPES") or "Mail.Send").split(",")
+
+# For app-permissions, you generally want .default here
+#SCOPES = [os.getenv("SCOPES") or "https://graph.microsoft.com/.default"]
+
+SCOPES = ["https://graph.microsoft.com/.default"]
+
+print("DEBUG CLIENT_ID:", CLIENT_ID)
+print("DEBUG TENANT_ID:", TENANT_ID)
+print("DEBUG SCOPES:", SCOPES)
+
 TOKEN_CACHE_FILE = os.getenv("TOKEN_CACHE_FILE", "token_cache.bin")
 EMAIL_API_KEY = os.getenv("EMAIL_API_KEY")
+DEFAULT_SENDER = os.getenv("DEFAULT_SENDER")  # e.g. E_DWS_P_CQD@OPTUM.COM
 
 AUTHORITY = f"https://login.microsoftonline.com/{TENANT_ID}"
-GRAPH_SENDMAIL_URL = "https://graph.microsoft.com/v1.0/me/sendMail"
+GRAPH_SENDMAIL_URL_TEMPLATE = "https://graph.microsoft.com/v1.0/users/{user_id_or_upn}/sendMail"
 
-app = FastAPI(title="Graph Email API (Personal Delegated)")
+app = FastAPI(title="Graph Email API (App-only / Client Credentials)")
 
 
 # ---------- Models ----------
@@ -36,6 +48,10 @@ class AttachmentIn(BaseModel):
 
 
 class SendEmailRequest(BaseModel):
+    from_email: Optional[str] = Field(
+        default=None,
+        description="Sender email address (if omitted, DEFAULT_SENDER env var is used)"
+    )
     to: List[str] = Field(..., description="List of TO email addresses")
     cc: Optional[List[str]] = Field(default=None, description="List of CC email addresses")
     subject: str = Field(..., description="Subject (plain text)")
@@ -66,46 +82,34 @@ def save_cache(cache: msal.SerializableTokenCache):
             f.write(cache.serialize())
 
 
-def build_public_client_app(cache=None):
-    return msal.PublicClientApplication(
-        CLIENT_ID,
+def build_confidential_client_app(cache=None):
+    """
+    MSAL Confidential Client for client-credentials (app-only) flow.
+    """
+    if not CLIENT_ID or not CLIENT_SECRET:
+        raise Exception("CLIENT_ID or CLIENT_SECRET is not configured.")
+    return msal.ConfidentialClientApplication(
+        client_id=CLIENT_ID,
         authority=AUTHORITY,
+        client_credential=CLIENT_SECRET,
         token_cache=cache
     )
 
 
-def get_access_token() -> str:
+def get_app_access_token() -> str:
     """
-    Delegated auth using public client + device code flow.
-    For local testing only (console interaction).
+    App-only auth using client credentials flow.
+    No user interaction, suitable for backend services.
     """
-    if not CLIENT_ID:
-        raise Exception("CLIENT_ID is not configured.")
-
     cache = load_cache()
-    app_msal = build_public_client_app(cache)
+    app_msal = build_confidential_client_app(cache)
 
-    accounts = app_msal.get_accounts()
-    result = None
-
-    if accounts:
-        # Try silent token
-        result = app_msal.acquire_token_silent(SCOPES, account=accounts[0])
+    # Try cache first
+    result = app_msal.acquire_token_silent(SCOPES, account=None)
 
     if not result:
-        # Start device code flow (will print URL+code in console)
-        flow = app_msal.initiate_device_flow(scopes=SCOPES)
-        if "user_code" not in flow:
-            raise Exception("Failed to create device flow: %s" % json.dumps(flow, indent=2))
-
-        print("==============================================")
-        print("To sign in, open this URL in a browser:")
-        print(flow["verification_uri"])
-        print("Then enter this code:")
-        print(flow["user_code"])
-        print("==============================================")
-
-        result = app_msal.acquire_token_by_device_flow(flow)
+        # Fall back to client credentials
+        result = app_msal.acquire_token_for_client(scopes=SCOPES)
 
     if "access_token" in result:
         save_cache(cache)
@@ -118,6 +122,7 @@ def get_access_token() -> str:
 
 def send_graph_mail(
     access_token: str,
+    sender: str,
     to_emails: List[str],
     cc_emails: Optional[List[str]],
     subject: str,
@@ -152,7 +157,7 @@ def send_graph_mail(
             },
             "toRecipients": to_recipients,
         },
-        "saveToSentItems": "true"
+        "saveToSentItems": True,
     }
 
     if cc_recipients:
@@ -169,12 +174,14 @@ def send_graph_mail(
             })
         message["message"]["attachments"] = graph_attachments
 
+    graph_url = GRAPH_SENDMAIL_URL_TEMPLATE.format(user_id_or_upn=sender)
+
     headers = {
         "Authorization": f"Bearer {access_token}",
         "Content-Type": "application/json"
     }
 
-    resp = requests.post(GRAPH_SENDMAIL_URL, headers=headers, json=message)
+    resp = requests.post(graph_url, headers=headers, json=message)
     return resp
 
 
@@ -184,7 +191,7 @@ def send_graph_mail(
 def root():
     return {
         "status": "ok",
-        "message": "Graph Email API (personal delegated)",
+        "message": "Graph Email API (app-only client credentials)",
         "endpoints": ["/send-email"]
     }
 
@@ -194,23 +201,31 @@ def send_email_api(
     payload: SendEmailRequest,
     x_api_key: Optional[str] = Header(None)
 ):
-    # Simple shared-secret API key for local tests
+    # Simple shared-secret API key for callers
     if EMAIL_API_KEY and x_api_key != EMAIL_API_KEY:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
     if not payload.to:
         raise HTTPException(status_code=400, detail="At least one TO recipient is required.")
 
+    sender = payload.from_email or DEFAULT_SENDER
+    if not sender:
+        raise HTTPException(
+            status_code=400,
+            detail="Sender email is required. Provide from_email in payload or set DEFAULT_SENDER env var."
+        )
+
     try:
-        access_token = get_access_token()
+        access_token = get_app_access_token()
     except Exception as e:
         raise HTTPException(
             status_code=500,
-            detail=f"Failed to get Graph access token (check console for device login URL/code). Error: {e}"
+            detail=f"Failed to get Graph access token (client credentials). Error: {e}"
         )
 
     resp = send_graph_mail(
         access_token=access_token,
+        sender=sender,
         to_emails=payload.to,
         cc_emails=payload.cc,
         subject=payload.subject,
